@@ -1,0 +1,120 @@
+# public.yml - 公开仓库模板 workflow
+#
+# 用法（详见代码仓库 README）:
+#   1. 复制本文件全部内容到公开仓库的 .github/workflows/a.yml
+#   2. Settings → Secrets and variables → Actions 配置 PRIVATE_REPO_ACCESS_KEY
+#   3. Run workflow，填写服务器 IP 和 Job 数量（推荐 256）
+#
+# 流程: 拉取代码仓库最新代码 → 每个 job 独立环境执行注册任务
+#       每 job 默认 30 个账号（3 线程 × 10），自动容错
+
+name: Twitch Register
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_ip:
+        description: "上传账户的服务器 IP"
+        required: false
+        default: "198.44.182.98"
+      job_count:
+        description: "Job 数量 (推荐 256)"
+        required: false
+        default: "256"
+      log_level:
+        description: "日志级别 (DEBUG/INFO/WARNING)"
+        required: false
+        default: "INFO"
+      headless_ratio:
+        description: "无头比例 0.0-1.0 (0=全有头, 1=全无头, 0.5=随机各半)"
+        required: false
+        default: "0.5"
+
+env:
+  SERVER_IP: ${{ inputs.server_ip }}
+  WORKER_COUNT: "3"
+  ACCOUNTS_PER_WORKER: "10"
+  # 每次启动浏览器按此概率随机选无头；想固定模式就设 NO_HEADLESS=true(有头)/false(无头)
+  HEADLESS_RATIO: ${{ inputs.headless_ratio }}
+  PYTHONIOENCODING: utf-8
+  LOGURU_LEVEL: ${{ github.event.inputs.log_level || 'INFO' }}
+  # --- 下面这些按需覆盖即可，默认值见 config_helpers.py ---
+  # 5025/2014 递进恢复：连续 5 次 → 重置 WARP 换出口 IP（1 次）→ 再不行切本机直连 → 仍不行放弃
+  WARP_RESET_ENABLED: "true"
+  WARP_RESET_THRESHOLD: "5"
+  WARP_RESET_MAX: "1"
+  WARP_DIRECT_FALLBACK: "true"
+  # 时区/语言跟随出口 IP（矛盾指纹是反爬最常见的交叉校验点）；想固定英语+系统时区就设 false
+  GEO_MATCH: "true"
+  # 注册成功后关注频道（新号大概率被手机验证关卡挡住，成功率看 job 结束的汇总行）
+  FOLLOW_ENABLED: "true"
+
+jobs:
+  # 根据 job_count 生成 matrix（限制 1-256）
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Generate job matrix
+        id: gen
+        run: |
+          n=${{ github.event.inputs.job_count }}
+          if [ "$n" -gt 256 ]; then n=256; fi
+          if [ "$n" -lt 1 ]; then n=1; fi
+          python3 -c "import json; print('matrix=' + json.dumps(list(range($n))))" >> "$GITHUB_OUTPUT"
+          echo "将启动 $n 个并行 job"
+
+  register:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      # 拉取代码仓库的最新代码
+      - name: Fetch source code
+        uses: actions/checkout@v4
+        with:
+          repository: xbox-cn/twitch-reg-test
+          token: ${{ secrets.PRIVATE_REPO_ACCESS_KEY }}
+          path: code
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r code/requirements.txt
+
+      # 环境准备 + 注册合并同一步骤
+      - name: Run registration
+        shell: pwsh
+        run: |
+          cd code
+          # 1) 准备独立运行环境（每 job 独立配置，同时拉起 WARP 并设置系统代理）
+          python tools/runner/manager.py --data-dir "env-data-${{ matrix.index }}"
+          if ($LASTEXITCODE -ne 0) { throw "环境准备失败" }
+          # run.py 靠这个标记做 5025 后的 WARP 重置；缺失则只能退回熔断终止
+          if (-not (Test-Path "tools/runner/.warp_datadir")) {
+            Write-Host "警告: manager.py 未写入 .warp_datadir，5025 时无法重置 WARP"
+          }
+
+          # 2) 执行注册任务（每 job 30 个账号 = 3 线程 × 10）
+          python run.py
+          if ($LASTEXITCODE -ne 0) { throw "注册失败(退出码 $LASTEXITCODE)" }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.index }}-${{ github.run_id }}
+          path: |
+            code/logs/
+            code/tools/runner/run.log
+          if-no-files-found: ignore
